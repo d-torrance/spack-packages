@@ -1,0 +1,31 @@
+name: Test topcom on macOS
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-14   # can also test macos-13, macos-15 in a matrix
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install prerequisites via Homebrew
+      run: |
+        brew install autoconf automake libtool bison flex
+
+    - name: Clone Spack
+      run: |
+        git clone https://github.com/spack/spack.git $HOME/spack
+        echo "SPACK_ROOT=$HOME/spack" >> $GITHUB_ENV
+
+    - name: Add this fork as a Spack repo
+      run: |
+        source $SPACK_ROOT/share/spack/setup-env.sh
+        spack repo add $GITHUB_WORKSPACE/repos/spack_repo/builtin
+
+    - name: Install topcom
+      run: |
+        source $SPACK_ROOT/share/spack/setup-env.sh
+        spack install topcom
