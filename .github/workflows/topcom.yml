@@ -6,7 +6,14 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14   # can also test macos-13, macos-15 in a matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-13
+          - macos-14
+          - macos-15
 
     steps:
     - uses: actions/checkout@v4
