@@ -35,4 +35,4 @@ jobs:
     - name: Install topcom
       run: |
         source $SPACK_ROOT/share/spack/setup-env.sh
-        spack install topcom
+        spack install --verbose topcom %clang
