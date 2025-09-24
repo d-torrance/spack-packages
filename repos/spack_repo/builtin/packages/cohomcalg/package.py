@@ -25,6 +25,8 @@ class Cohomcalg(MakefilePackage):
 
     depends_on("cxx", type="build")
 
+    patch("fix-literal-suffix.patch")
+
     def install(self, spec, prefix):
         mkdirp(prefix.bin)
         install("bin/cohomcalg", prefix.bin)
