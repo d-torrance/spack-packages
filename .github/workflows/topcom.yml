@@ -30,6 +30,8 @@ jobs:
     - name: Add this fork as a Spack repo
       run: |
         source $SPACK_ROOT/share/spack/setup-env.sh
+        spack compiler find /usr/bin
+        spack compilers
         spack repo add $GITHUB_WORKSPACE/repos/spack_repo/builtin
 
     - name: Install topcom
