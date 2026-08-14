@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
+import os
+
 from spack_repo.builtin.build_systems.autotools import AutotoolsPackage
 
 from spack.package import *
@@ -40,6 +42,31 @@ class Flint(AutotoolsPackage):
     depends_on("mpfr")  # Could also be built against mpir
 
     depends_on("m4", type="build")
+
+    @when("@3.4.0:")
+    def patch(self):
+        # configure tells in-tree from out-of-tree builds by comparing two
+        # spellings of one path textually, so a symlinked build path makes an
+        # in-tree build look out-of-tree -- as on macOS, where the stage sits
+        # under /var, a symlink to /private/var.  src/fmpz/fmpz.c then lands in
+        # the source list twice, once from the wildcard and once from the
+        # out-of-tree special case, and "ld -r" is handed the same object twice:
+        # 12 duplicate symbols in build/fmpz_merged.lo.  Compare the two paths
+        # with both sides resolved instead.
+        #
+        # The line is identical in every release that has it, so match on it
+        # alone rather than carrying a patch per version.  Releases ship a
+        # generated configure and are built without autoreconf; a git checkout
+        # has only configure.ac and gets one generated.  Edit whichever are
+        # present.
+        for f in ("configure", "configure.ac"):
+            if os.path.exists(f):
+                filter_file(
+                    'if test "$ac_abs_confdir" = "`pwd`";',
+                    'if test "`cd "$ac_abs_confdir" && pwd -P`" = "`pwd -P`";',
+                    f,
+                    string=True,
+                )
 
     def configure_args(self):
         spec = self.spec
