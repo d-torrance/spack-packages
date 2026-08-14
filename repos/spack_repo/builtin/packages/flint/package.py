@@ -55,18 +55,20 @@ class Flint(AutotoolsPackage):
         # with both sides resolved instead.
         #
         # The line is identical in every release that has it, so match on it
-        # alone rather than carrying a patch per version.  Releases ship a
-        # generated configure and are built without autoreconf; a git checkout
-        # has only configure.ac and gets one generated.  Edit whichever are
-        # present.
-        for f in ("configure", "configure.ac"):
-            if os.path.exists(f):
-                filter_file(
-                    'if test "$ac_abs_confdir" = "`pwd`";',
-                    'if test "`cd "$ac_abs_confdir" && pwd -P`" = "`pwd -P`";',
-                    f,
-                    string=True,
-                )
+        # alone rather than carrying a patch per version.
+        #
+        # Edit exactly one file.  Releases ship a generated configure and are
+        # built without autoreconf; editing configure.ac as well would leave it
+        # newer, and flint's maintainer mode rule re-runs bootstrap.sh whenever
+        # that happens, part way through the build.  A git checkout has only
+        # configure.ac, and spack generates configure from it afterwards.
+        target = "configure" if os.path.exists("configure") else "configure.ac"
+        filter_file(
+            'if test "$ac_abs_confdir" = "`pwd`";',
+            'if test "`cd "$ac_abs_confdir" && pwd -P`" = "`pwd -P`";',
+            target,
+            string=True,
+        )
 
     def configure_args(self):
         spec = self.spec
