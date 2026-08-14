@@ -1,0 +1,126 @@
+# Throwaway workflow for testing the lrslib darwin fixes on
+# d-torrance/spack-packages.  Delete before opening the pull request.
+#
+# spack is the only packaging of lrslib that runs the upstream makefile's
+# install target: homebrew and Macaulay2 both build the lrs binary and copy it
+# themselves (M2 sets INSTALLCMD = true), so neither meets "install -t".  Of the
+# ones that do run it, nixpkgs only needs the -soname fix because its darwin
+# stdenv bundles GNU coreutils; MacPorts, like spack, needs both fixes.
+name: Test lrslib
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lrslib:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          # where it was broken
+          - macos-latest
+          # confirms the unconditional "install -t" rewrite is harmless on the
+          # platform that already worked
+          - ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Clone spack
+        run: |
+          git clone --depth 1 https://github.com/spack/spack.git $HOME/spack
+          echo "SPACK_ROOT=$HOME/spack" >> $GITHUB_ENV
+
+      - name: Add this fork as a spack repo
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack compiler find /usr/bin
+          spack compilers
+          spack external find --all
+          spack repo add $GITHUB_WORKSPACE/repos/spack_repo/builtin
+          spack repo list
+
+      - name: Install
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack install --verbose lrslib@7.3
+
+      # The install target is what used to fail, so check it actually put the
+      # headers and the library where they belong rather than just exiting 0.
+      - name: Check the install laid things out
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          prefix=$(spack location -i lrslib@7.3)
+          find "$prefix" -type f -o -type l | sed "s|^$prefix|<prefix>|" | sort
+          test -x "$prefix/bin/lrs"
+          for header in lrslib.h lrsdriver.h lrsgmp.h lrslong.h lrsmp.h lrsrestart.h
+          do test -f "$prefix/include/lrslib/$header" || { echo "::error::missing $header"; exit 1; }
+          done
+
+      # The whole point of the -install_name substitution: the shared library
+      # has to be a real dynamic library recording a usable path, not a Mach-O
+      # object that merely got named .so.
+      - name: Check the shared library
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          prefix=$(spack location -i lrslib@7.3)
+          lib=$(ls "$prefix"/lib/liblrs.so* 2>/dev/null | head -1)
+          if [ -z "$lib" ]
+          then echo "::error title=No shared library::nothing matching liblrs.so* in $prefix/lib"; exit 1
+          fi
+          echo "found $lib"
+          if [ "$RUNNER_OS" = macOS ]
+          then
+              file "$lib"
+              file "$lib" | grep -q "dynamically linked shared library" \
+                  || { echo "::error title=Not a dylib::-dynamiclib did not take effect"; exit 1; }
+              # LC_ID_DYLIB should be the absolute path in the spack store
+              otool -D "$lib" | tee id.txt
+              grep -q "$prefix/lib/" id.txt \
+                  || { echo "::error title=Bad install name::LC_ID_DYLIB is not under the spack prefix"; exit 1; }
+          else
+              file "$lib"
+              objdump -p "$lib" | grep -i soname
+          fi
+
+      # Building is not the same as working: enumerate the vertices of a square,
+      # which has exactly 4 of them.
+      - name: Solve a small problem
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack load lrslib@7.3
+          cat > square.ine <<'EOF'
+          square
+          H-representation
+          begin
+          4 3 rational
+          1 1 0
+          1 0 1
+          1 -1 0
+          1 0 -1
+          end
+          EOF
+          lrs square.ine | tee out.txt
+          grep -q "V-representation" out.txt
+          grep -q "vertices=4" out.txt
+
+      - name: Collect build logs
+        if: failure()
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          mkdir -p build-logs
+          find "$(spack location -S)" -name 'spack-build-*.txt' | while read -r log
+          do cp "$log" "build-logs/$(basename $(dirname "$log"))-$(basename "$log")"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-logs-${{ matrix.runner }}
+          path: build-logs
+          if-no-files-found: ignore
