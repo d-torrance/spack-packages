@@ -1,0 +1,166 @@
+# Throwaway workflow for testing the mpsolve bison constraint on
+# d-torrance/spack-packages.  Delete before opening the pull request.
+#
+# The bug this checks for only appears when a too-old bison is visible as an
+# external, which is exactly what "spack external find --all" arranges on
+# macOS: Apple still ships bison 2.3, whose generated yacc-parser.h does not
+# declare yyparse, so the lexer fails to compile under clang 16+.  The Linux
+# containers never ran "external find", so spack built bison 3.8.2 there and
+# the fix in #6056 appeared to work.
+name: Test mpsolve
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  install:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-latest
+          - ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Clone spack
+        run: |
+          git clone --depth 1 https://github.com/spack/spack.git $HOME/spack
+          echo "SPACK_ROOT=$HOME/spack" >> $GITHUB_ENV
+
+      - name: Add this fork as a spack repo
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack compiler find /usr/bin
+          spack compilers
+          # --all is deliberate: it is what registers the system bison, and so
+          # what reproduces the failure.  Do not drop it.
+          spack external find --all
+          spack repo add $GITHUB_WORKSPACE/repos/spack_repo/builtin
+          spack repo list
+
+      - name: Report which bison the externals offer
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          if [ -f "$HOME/.spack/packages.yaml" ]
+          then grep -A6 -i bison "$HOME/.spack/packages.yaml" || echo "no bison external registered"
+          else echo "no packages.yaml at all"
+          fi
+
+      - name: Concretize
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack spec -I mpsolve@3.2.3
+
+      # The heart of the test: with bison 2.3 sitting right there as an
+      # external, the constraint must still pull in a bison that works.
+      - name: The concretized bison must be at least 3
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack spec --json mpsolve@3.2.3 > spec.json
+          python3 - spec.json <<'EOF'
+          import json, re, sys
+
+          data = json.load(open(sys.argv[1]))
+          spec = data.get("spec", data)
+          nodes = spec.get("nodes", spec if isinstance(spec, list) else [])
+          bisons = [n for n in nodes if n.get("name") == "bison"]
+          if not bisons:
+              sys.exit("::error title=No bison::bison is not in the concretized DAG")
+          for node in bisons:
+              version = str(node.get("version"))
+              external = node.get("external_path") or node.get("external")
+              print(f"bison {version}  external={external}")
+              major = re.match(r"\d+", version)
+              if not major:
+                  sys.exit(f"::error title=Unparsable version::bison {version}")
+              if int(major.group()) < 3:
+                  sys.exit(
+                      f"::error title=Old bison concretized::"
+                      f"mpsolve got bison {version} (external={external}); "
+                      f"the @3: constraint did not take effect"
+                  )
+          print("OK: every bison in the DAG is >= 3")
+          EOF
+
+      - name: Install
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack install --verbose mpsolve@3.2.3
+
+      # Building is not the same as working, and the regenerated parser is
+      # exactly what we changed, so feed it a polynomial: x^2 - 1, whose roots
+      # are +/-1.  The .pol format is a comment, "dri", the precision, the
+      # degree, then the coefficients from the constant term up.
+      - name: Solve a polynomial
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack load mpsolve@3.2.3
+          mpsolve -v 2>&1 | tee version.txt
+          grep -q 3.2.3 version.txt
+          printf '!x^2-1\ndri\n0\n2\n-1\n0\n1\n' > x2minus1.pol
+          mpsolve x2minus1.pol 2>&1 | tee roots.txt
+          test -s roots.txt
+
+      - name: Collect build logs
+        if: failure()
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          mkdir -p build-logs
+          find "$(spack location -S)" -name 'spack-build-*.txt' | while read -r log
+          do cp "$log" "build-logs/$(basename $(dirname "$log"))-$(basename "$log")"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-logs-${{ matrix.runner }}
+          path: build-logs
+          if-no-files-found: ignore
+
+  # Control: asking for the old bison explicitly must now be refused.  Before
+  # the constraint this concretized happily and then failed to compile, so this
+  # is what demonstrates the constraint is doing the work.
+  reject-old-bison:
+    name: macos-latest / bison@2.3 must be refused
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Clone spack
+        run: |
+          git clone --depth 1 https://github.com/spack/spack.git $HOME/spack
+          echo "SPACK_ROOT=$HOME/spack" >> $GITHUB_ENV
+
+      - name: Add this fork as a spack repo
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack compiler find /usr/bin
+          spack external find --all
+          spack repo add $GITHUB_WORKSPACE/repos/spack_repo/builtin
+
+      - name: mpsolve@3.2.3 must not accept bison@2.3
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          # Guard against a vacuous pass: if this runner has no bison 2.x to
+          # offer, there is nothing here to reject and the check proves nothing.
+          if ! grep -qi 'bison' "$HOME/.spack/packages.yaml" 2>/dev/null
+          then
+              echo "::warning title=Nothing to reject::no bison external on this runner, so this check is vacuous"
+              exit 0
+          fi
+          grep -A6 -i bison "$HOME/.spack/packages.yaml"
+          if spack spec mpsolve@3.2.3 ^bison@2.3
+          then
+              echo "::error title=Constraint not enforced::mpsolve@3.2.3 still concretizes with bison@2.3"
+              exit 1
+          fi
+          echo "bison@2.3 was correctly refused"
