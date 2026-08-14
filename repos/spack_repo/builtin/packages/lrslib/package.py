@@ -45,6 +45,32 @@ class Lrslib(MakefilePackage):
         url = "http://cgm.cs.mcgill.ca/~avis/C/lrslib/archive/lrslib-0{0}.tar.gz"
         return url.format(version.joined)
 
+    # Only @7.3: builds with the upstream makefile; earlier versions use the
+    # Makefile.spack that the patch above adds.
+    @when("@7.3:")
+    def edit(self, spec, prefix):
+        # "install -t DIR FILES" is a GNU extension, and BSD install -- the one
+        # macOS ships -- rejects it.  Both accept "install FILES DIR", so
+        # rewrite it everywhere rather than only where it breaks, which keeps
+        # the substitution exercised by the builds everyone runs.  This does
+        # lean on the "mkdir -p" the makefile runs on the preceding line: given
+        # exactly two arguments, install treats the last as a directory only if
+        # it already exists.
+        filter_file(r"install -t (\S+) (.*)", r"install \2 \1", "makefile")
+
+        if spec.satisfies("platform=darwin"):
+            # Darwin needs different flags to build a dynamic library, and
+            # records a path in the library instead of a bare soname.  MacPorts
+            # and nixpkgs both carry this same substitution.  The trailing slash
+            # is load bearing: $(SONAME) follows immediately in the makefile, so
+            # it completes the install name.
+            filter_file(
+                "-shared -Wl,-soname=",
+                f"-dynamiclib -install_name {prefix.lib}/",
+                "makefile",
+                string=True,
+            )
+
     @property
     def build_targets(self):
         if self.spec.satisfies("@:6.2"):
