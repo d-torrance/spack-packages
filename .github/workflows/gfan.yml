@@ -52,15 +52,14 @@ jobs:
         run: |
           source $SPACK_ROOT/share/spack/setup-env.sh
           spack versions gfan
-          # Write to a file first: piping straight into python turned a failed
-          # "spack spec" into an unreadable JSON traceback, because the pipeline
-          # exit status was python's.
-          spack spec --json gfan > spec.json
-          version=$(python3 -c '
-          import json, sys
-          nodes = json.load(open("spec.json"))["spec"]["nodes"]
-          print(next(n["version"] for n in nodes if n["name"] == "gfan"))
-          ')
+          # --json printed nothing here, for reasons not worth chasing, and
+          # parsing it only turned that into a JSON traceback.  --format prints
+          # exactly the one field wanted, with no parsing at all.
+          spack spec --format '{version}' gfan | tee version.txt
+          version=$(tr -d '[:space:]' < version.txt)
+          if [ -z "$version" ]
+          then echo "::error title=No version::spack spec printed nothing"; exit 1
+          fi
           echo "plain \"gfan\" concretizes to $version"
           echo ":mag: plain \`gfan\` concretizes to **$version**" >> "$GITHUB_STEP_SUMMARY"
           # Also show what macaulay2 would pick, which is the question that
