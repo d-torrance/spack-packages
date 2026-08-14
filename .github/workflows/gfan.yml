@@ -43,14 +43,22 @@ jobs:
           spack compiler find /usr/bin
           spack external find --all
           spack repo add $GITHUB_WORKSPACE/repos/spack_repo/builtin
+          # The commands above already indexed the builtin repo spack
+          # bootstrapped for itself, which lacks 0.8beta's patch, so swapping in
+          # this fork leaves that patch index stale and sha256 lookups fail.
+          spack clean -m
 
       - name: Report the preferred version
         run: |
           source $SPACK_ROOT/share/spack/setup-env.sh
           spack versions gfan
-          version=$(spack spec --json gfan | python3 -c '
+          # Write to a file first: piping straight into python turned a failed
+          # "spack spec" into an unreadable JSON traceback, because the pipeline
+          # exit status was python's.
+          spack spec --json gfan > spec.json
+          version=$(python3 -c '
           import json, sys
-          nodes = json.load(sys.stdin)["spec"]["nodes"]
+          nodes = json.load(open("spec.json"))["spec"]["nodes"]
           print(next(n["version"] for n in nodes if n["name"] == "gfan"))
           ')
           echo "plain \"gfan\" concretizes to $version"
@@ -89,6 +97,10 @@ jobs:
           spack compilers
           spack external find --all
           spack repo add $GITHUB_WORKSPACE/repos/spack_repo/builtin
+          # The commands above already indexed the builtin repo spack
+          # bootstrapped for itself, which lacks 0.8beta's patch, so swapping in
+          # this fork leaves that patch index stale and sha256 lookups fail.
+          spack clean -m
           spack repo list
 
       - name: Concretize
