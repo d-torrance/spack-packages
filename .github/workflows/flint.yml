@@ -1,0 +1,163 @@
+# Throwaway workflow for testing flint's macOS build on
+# d-torrance/spack-packages.  Delete before opening any pull request.
+#
+# flint fails on macOS arm64 with 12 duplicate symbols while partial linking
+# build/fmpz_merged.lo.  Every duplicate names the same object,
+# build/fmpz/fmpz.lo, and it is compiled only once, so it is handed to "ld -r"
+# twice rather than two files colliding.
+#
+# The cause is in Makefile.in:
+#
+#   $(1)_SOURCES := $(wildcard $(ABS_SRC_DIR)/$(1)/*.c)
+#   ifeq ($(IS_OUT_OF_TREE),1)
+#   fmpz_SOURCES += $(SRC_DIR)/fmpz/fmpz.c
+#   endif
+#
+# src/fmpz/fmpz.c is not in the release; AC_CONFIG_LINKS materialises it in the
+# build directory.  In-tree the wildcard finds it, out-of-tree it does not and
+# the append supplies it -- complementary, so a genuine out-of-tree build never
+# double-lists.  But configure picks between them by comparing $ac_abs_confdir
+# with `pwd` textually, and macOS spells the stage path two ways, since it sits
+# under /var, a symlink to /private/var.  Measured before the fix: macOS
+# IS_OUT_OF_TREE=1 with two occurrences, Linux 0 with one.
+#
+# Each leg asserts the source list is right after configure, then builds and
+# computes, so the fast check and the slow one share a single dependency build.
+name: Test flint
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  flint:
+    name: ${{ matrix.runner }} / flint@${{ matrix.version }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, ubuntu-latest]
+        version:
+          # 3.4.0 and 3.5.0 carry the same faulty line as 3.6.0.  A patch file
+          # would have needed one copy per version, since the surrounding
+          # context differs; matching the line alone does not.
+          - "3.4.0"
+          - "3.5.0"
+          - "3.6.0"
+          # The interesting one: a git checkout ships no generated configure, so
+          # the edit has to land in configure.ac and survive autoreconf.
+          - "main"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Clone spack
+        run: |
+          git clone --depth 1 https://github.com/spack/spack.git $HOME/spack
+          echo "SPACK_ROOT=$HOME/spack" >> $GITHUB_ENV
+
+      - name: Add this fork as a spack repo
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack compiler find /usr/bin
+          spack external find --all
+          spack repo add $GITHUB_WORKSPACE/repos/spack_repo/builtin
+          spack clean -m
+
+      # Stop after configure first: the generated Makefile answers the question
+      # in a couple of minutes, and a failure here is far easier to read than a
+      # linker error twenty minutes in.
+      - name: Configure only
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack install --until configure flint@${{ matrix.version }}
+
+      - name: Assert the fmpz source list is right
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          src=$(spack location -c flint@${{ matrix.version }} 2>/dev/null || true)
+          if [ -z "$src" ] || [ ! -f "$src/Makefile" ]
+          then src=$(dirname "$(find /tmp "$HOME/spack/var/spack/stage" -maxdepth 5 -name Makefile -path '*flint*spack-src*' 2>/dev/null | head -1)")
+          fi
+          echo "source dir: $src"
+          test -f "$src/Makefile" || { echo "::error::no generated Makefile in $src"; exit 1; }
+
+          echo "logical  pwd: $(cd "$src" && pwd)"
+          echo "physical pwd: $(cd "$src" && pwd -P)"
+          grep -E "^IS_OUT_OF_TREE" "$src/Makefile" || echo "(IS_OUT_OF_TREE not found)"
+          out_of_tree=$(sed -n 's/^IS_OUT_OF_TREE *:*= *//p' "$src/Makefile" | tr -d '[:space:]')
+
+          printf 'print-%%: ; @echo $($*)\n' > /tmp/printvar.mk
+          if ! (cd "$src" && make -f Makefile -f /tmp/printvar.mk print-fmpz_LOBJS > /tmp/lobjs.txt 2>/tmp/lobjs.err)
+          then
+              echo "::error title=Could not query the Makefile::make failed, so any count would be meaningless"
+              head -5 /tmp/lobjs.err
+              exit 1
+          fi
+          lobjs=$(tr ' ' '\n' < /tmp/lobjs.txt | grep -c "fmpz/fmpz\.lo" || true)
+
+          {
+              echo "### ${{ matrix.runner }} / flint@${{ matrix.version }}"
+              echo "- IS_OUT_OF_TREE = \`${out_of_tree:-?}\`"
+              echo "- fmpz.lo occurrences = \`$lobjs\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "IS_OUT_OF_TREE=$out_of_tree  fmpz.lo occurrences=$lobjs"
+
+          if [ "$out_of_tree" != "0" ]
+          then echo "::error title=Still out of tree::IS_OUT_OF_TREE=$out_of_tree, so the path comparison is still failing"; exit 1
+          fi
+          if [ "$lobjs" != "1" ]
+          then echo "::error title=Wrong occurrence count::fmpz.lo appears $lobjs times, expected 1"; exit 1
+          fi
+
+      - name: Build
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack install --verbose flint@${{ matrix.version }}
+
+      # fmpz is the module whose object was doubled, and promoting past one limb
+      # is what pulls in the mpz pool those duplicate symbols belonged to, so
+      # 30! exercises the affected code rather than merely linking.
+      - name: Compute 30! through fmpz
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          flint=$(spack location -i flint@${{ matrix.version }})
+          gmp=$(spack location -i gmp)
+          cat > fac.c <<'EOF'
+          #include <stdio.h>
+          #include <flint/fmpz.h>
+          int main(void)
+          {
+              fmpz_t a;
+              fmpz_init(a);
+              fmpz_fac_ui(a, 30);
+              fmpz_print(a);
+              printf("\n");
+              fmpz_clear(a);
+              return 0;
+          }
+          EOF
+          cc fac.c -o fac \
+              -I"$flint/include" -I"$gmp/include" \
+              -L"$flint/lib" -L"$gmp/lib" -lflint -lgmp \
+              -Wl,-rpath,"$flint/lib" -Wl,-rpath,"$gmp/lib"
+          ./fac | tee fac.txt
+          grep -qx "265252859812191058636308480000000" fac.txt
+
+      - name: Collect build logs
+        if: failure()
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          mkdir -p build-logs
+          find "$(spack location -S)" -name 'spack-build-*.txt' | while read -r log
+          do cp "$log" "build-logs/$(basename $(dirname "$log"))-$(basename "$log")"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-logs-${{ matrix.runner }}-${{ matrix.version }}
+          path: build-logs
+          if-no-files-found: ignore
