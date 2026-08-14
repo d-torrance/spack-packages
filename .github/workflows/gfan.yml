@@ -1,0 +1,146 @@
+# Throwaway workflow for testing spack-packages#6090 on macOS, on
+# d-torrance/spack-packages.  Not part of the pull request: this branch sits on
+# top of the PR branch so the PR itself stays clean.
+#
+# What this is for: #6090's portability work was verified by building gfan
+# directly on macOS, where the system compiler *is* g++ and gmp is on the
+# default include path.  That is not the configuration that broke under spack.
+# There, apple-clang's wrapper directory provides clang++ and no g++, so gfan's
+# hardcoded "CXX = $(PREFIX)g++" bypassed the wrapper entirely and could not
+# find gmp.h.  #6090 passes CXX={spack_cxx} for every version, which should fix
+# that -- untested through spack until now.
+#
+# 0.6.2 is the leg to watch.  It does not get the 0.8beta portability patch, and
+# two flags the patch removes for clang are hardcoded in its Makefile rules:
+# -fno-guess-branch-probability (line 397) and -rdynamic (line 423).  Once CXX
+# is really clang++, those may well fail.
+name: Test gfan
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Cheap and worth knowing on its own: if spack treats 0.8beta as a prerelease
+  # and keeps preferring 0.6.2, then 0.6.2 is what Macaulay2 will keep building,
+  # and it is the version whose macOS support actually matters.
+  which-version:
+    name: what does plain "gfan" concretize to?
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Clone spack
+        run: |
+          git clone --depth 1 https://github.com/spack/spack.git $HOME/spack
+          echo "SPACK_ROOT=$HOME/spack" >> $GITHUB_ENV
+
+      - name: Add this fork as a spack repo
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack compiler find /usr/bin
+          spack external find --all
+          spack repo add $GITHUB_WORKSPACE/repos/spack_repo/builtin
+
+      - name: Report the preferred version
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack versions gfan
+          version=$(spack spec --json gfan | python3 -c '
+          import json, sys
+          nodes = json.load(sys.stdin)["spec"]["nodes"]
+          print(next(n["version"] for n in nodes if n["name"] == "gfan"))
+          ')
+          echo "plain \"gfan\" concretizes to $version"
+          echo ":mag: plain \`gfan\` concretizes to **$version**" >> "$GITHUB_STEP_SUMMARY"
+          # Also show what macaulay2 would pick, which is the question that
+          # actually matters for the M2 CI.
+          spack spec macaulay2 | grep -i gfan || true
+
+  build:
+    name: ${{ matrix.runner }} / gfan@${{ matrix.version }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: macos-latest,  version: "0.8beta"}
+          - {runner: macos-latest,  version: "0.6.2"}
+          # Linux legs: 0.8beta is new, and 0.6.2 guards against the recipe
+          # rewrite regressing the platform that already worked.
+          - {runner: ubuntu-latest, version: "0.8beta"}
+          - {runner: ubuntu-latest, version: "0.6.2"}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Clone spack
+        run: |
+          git clone --depth 1 https://github.com/spack/spack.git $HOME/spack
+          echo "SPACK_ROOT=$HOME/spack" >> $GITHUB_ENV
+
+      - name: Add this fork as a spack repo
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack compiler find /usr/bin
+          spack compilers
+          spack external find --all
+          spack repo add $GITHUB_WORKSPACE/repos/spack_repo/builtin
+          spack repo list
+
+      - name: Concretize
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack spec -I gfan@${{ matrix.version }}
+
+      - name: Install
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack install --verbose gfan@${{ matrix.version }}
+
+      # Confirm the compiler override actually reached the build, rather than
+      # the build having merely succeeded for some other reason.
+      - name: Check which compiler the build used
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          log=$(find "$(spack location -S)" -name 'spack-build-out.txt' | head -1)
+          if [ -z "$log" ]
+          then echo "::notice::no build log kept (installed from cache?)"; exit 0
+          fi
+          grep -m3 -E "^(/[^ ]*)?(clang\+\+|g\+\+|c\+\+)" "$log" || true
+          if [ "$RUNNER_OS" = macOS ] && grep -qE "^g\+\+ " "$log"
+          then
+              echo "::error title=Wrapper bypassed::the build ran bare g++, so CXX={spack_cxx} did not take effect"
+              exit 1
+          fi
+
+      # gfan's own testsuite case 0001GroebnerFan, whose expected F_VECTOR is
+      # identical in 0.6.2 and 0.8beta.
+      - name: Compute a Groebner fan
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack load gfan@${{ matrix.version }}
+          gfan _version
+          printf 'Q[a,b,c]\n{aab-c,bbc-a,cca-b}\n' > ideal.txt
+          gfan _bases < ideal.txt | gfan _topolyhedralfan | grep F_VECTOR -A1 | tee fan.txt
+          grep -q "F_VECTOR" fan.txt
+          grep -qE "^1 19 51 33$" fan.txt
+
+      - name: Collect build logs
+        if: failure()
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          mkdir -p build-logs
+          find "$(spack location -S)" -name 'spack-build-*.txt' | while read -r log
+          do cp "$log" "build-logs/$(basename $(dirname "$log"))-$(basename "$log")"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-logs-${{ matrix.runner }}-${{ matrix.version }}
+          path: build-logs
+          if-no-files-found: ignore
