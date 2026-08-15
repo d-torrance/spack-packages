@@ -43,6 +43,12 @@ class Flint(AutotoolsPackage):
 
     depends_on("m4", type="build")
 
+    # A git checkout ships no configure, so one has to be generated.
+    with when("@main"):
+        depends_on("autoconf", type="build")
+        depends_on("automake", type="build")
+        depends_on("libtool", type="build")
+
     @when("@3.4.0:")
     def patch(self):
         # configure tells in-tree from out-of-tree builds by comparing two
