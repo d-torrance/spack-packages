@@ -40,6 +40,9 @@ jobs:
       matrix:
         runner: [macos-latest, ubuntu-latest]
         version:
+          # Predates IS_OUT_OF_TREE entirely, so the fix is scoped away from it.
+          # Here to show that scoping really does leave it alone.
+          - "3.1.2"
           # 3.4.0 and 3.5.0 carry the same faulty line as 3.6.0.  A patch file
           # would have needed one copy per version, since the surrounding
           # context differs; matching the line alone does not.
@@ -86,7 +89,19 @@ jobs:
 
           echo "logical  pwd: $(cd "$src" && pwd)"
           echo "physical pwd: $(cd "$src" && pwd -P)"
-          grep -E "^IS_OUT_OF_TREE" "$src/Makefile" || echo "(IS_OUT_OF_TREE not found)"
+
+          # Versions before 3.4.0 have no IS_OUT_OF_TREE and no fmpz special
+          # case, which is why the fix is scoped away from them.  There is
+          # nothing to assert; the build below is the whole point for them.
+          if ! grep -qE "^IS_OUT_OF_TREE" "$src/Makefile"
+          then
+              echo "::notice title=Not applicable::no IS_OUT_OF_TREE in this version, so nothing to assert"
+              echo "### ${{ matrix.runner }} / flint@${{ matrix.version }} -- predates IS_OUT_OF_TREE" \
+                  >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+          fi
+
+          grep -E "^IS_OUT_OF_TREE" "$src/Makefile"
           out_of_tree=$(sed -n 's/^IS_OUT_OF_TREE *:*= *//p' "$src/Makefile" | tr -d '[:space:]')
 
           printf 'print-%%: ; @echo $($*)\n' > /tmp/printvar.mk
