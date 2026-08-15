@@ -1,0 +1,10 @@
+--- a/lib/user_exit.c
++++ b/lib/user_exit.c
+@@ -8,6 +8,7 @@
+ 
+ #ifdef USESIGTERM
+ 
++#include <stdio.h>
+ #include <unistd.h>
+ #include <sys/types.h>
+ #include <sys/time.h>
