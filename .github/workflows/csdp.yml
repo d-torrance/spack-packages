@@ -1,0 +1,138 @@
+# Throwaway workflow for testing the csdp changes on d-torrance/spack-packages.
+# Delete this file before opening the pull request against spack/spack-packages.
+name: Test csdp
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  csdp:
+    name: ${{ matrix.runner }} / ${{ matrix.spec }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS is the new territory: apple-clang needs -Xpreprocessor
+          # -fopenmp plus libomp from llvm-openmp, so test both variants.
+          - {runner: macos-latest,      spec: csdp@6.2.0 +openmp}
+          - {runner: macos-latest,      spec: csdp@6.2.0 ~openmp}
+          # The failure that started this: -m64 is not an option on aarch64.
+          - {runner: ubuntu-24.04-arm,  spec: csdp@6.2.0 +openmp}
+          # x86_64 control, to catch a regression on the platform that worked.
+          - {runner: ubuntu-latest,     spec: csdp@6.2.0 +openmp}
+          # 6.1.1 is deliberately not tested here.  It cannot link at all in
+          # spack today: its per-directory Makefiles hardcode -llapack -lblas,
+          # and unlike 6.2.0 it has no top level "export LIBS" for the recipe to
+          # strip.  That is a separate bug from the flags this branch is about.
+
+    # Passed to spack unquoted below: the ~ in ~openmp arrives by variable
+    # expansion, which bash does not tilde-expand.
+    env:
+      SPEC: ${{ matrix.spec }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Clone spack
+        run: |
+          git clone --depth 1 https://github.com/spack/spack.git $HOME/spack
+          echo "SPACK_ROOT=$HOME/spack" >> $GITHUB_ENV
+
+      - name: Add this fork as a spack repo
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack compiler find /usr/bin
+          spack compilers
+          spack external find --all
+          spack repo add $GITHUB_WORKSPACE/repos/spack_repo/builtin
+          # The commands above already indexed the builtin repo that spack
+          # bootstrapped for itself, which has no stdio.patch, so swapping in
+          # this fork leaves that patch index stale and lookups by sha256 fail:
+          #   Couldn't find patch for package builtin.csdp with sha256: ...
+          # An artifact of substituting a repo underneath spack, not something
+          # an ordinary install runs into.
+          spack clean -m
+          # the fork's builtin should be the one spack uses
+          spack repo list
+
+      - name: Concretize
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack spec -I $SPEC
+
+      - name: Install
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          spack install --verbose $SPEC
+
+      # The point of the exercise: +openmp must actually link an OpenMP runtime
+      # and ~openmp must not.  Compiling is not enough -- apple-clang accepts
+      # -Xpreprocessor -fopenmp but will not pull in libomp on its own.
+      - name: Check for the OpenMP runtime
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          csdp=$(spack location -i $SPEC)/bin/csdp
+          # Check this first: otool/ldd failing on a missing file left the
+          # pipeline exit status to tee, so a no-op "make install" produced
+          # linked=no and this check passed for the ~openmp leg by accident.
+          if [ ! -x "$csdp" ]
+          then
+              echo "::error title=Nothing installed::$csdp is missing; make install did nothing"
+              exit 1
+          fi
+          if [ "$RUNNER_OS" = macOS ]
+          then otool -L "$csdp" | tee libs.txt
+          else ldd "$csdp" | tee libs.txt
+          fi
+          if grep -qiE 'libomp|libgomp' libs.txt
+          then linked=yes
+          else linked=no
+          fi
+          case "$SPEC" in
+              *"+openmp") want=yes ;;
+              *"~openmp") want=no ;;
+              # 6.1.1 has no openmp variant, so make no claim either way
+              *) echo "no OpenMP expectation for $SPEC (linked=$linked)"; exit 0 ;;
+          esac
+          if [ "$linked" = "$want" ]
+          then
+              echo ":white_check_mark: \`$SPEC\` on ${{ matrix.runner }} -- OpenMP runtime linked=$linked, as expected." \
+                  >> "$GITHUB_STEP_SUMMARY"
+          else
+              echo "::error title=OpenMP runtime mismatch::$SPEC on ${{ matrix.runner }}: expected linked=$want, got linked=$linked"
+              exit 1
+          fi
+
+      # Building is not the same as working: solve a problem whose answer we
+      # know.  theta1's optimal value is 23.
+      - name: Solve theta1
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          version=$(echo "$SPEC" | sed -n 's/^csdp@\([0-9.]*\).*/\1/p')
+          curl -sLo Csdp.tgz \
+              "https://www.coin-or.org/download/source/Csdp/Csdp-$version.tgz"
+          tar xzf Csdp.tgz
+          $(spack location -i $SPEC)/bin/csdp \
+              "Csdp-$version/test/theta1.dat-s" | tee solve.txt
+          grep -q "Success: SDP solved" solve.txt
+          grep -q "Primal objective value: 2.3000000e+01" solve.txt
+
+      - name: Collect build logs
+        if: failure()
+        run: |
+          source $SPACK_ROOT/share/spack/setup-env.sh
+          mkdir -p build-logs
+          find "$(spack location -S)" -name 'spack-build-*.txt' | while read -r log
+          do cp "$log" "build-logs/$(basename $(dirname "$log"))-$(basename "$log")"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-logs-${{ matrix.runner }}-${{ matrix.spec }}
+          path: build-logs
+          if-no-files-found: ignore
