@@ -1,0 +1,228 @@
+# Checks the csdp recipe on the platforms the 6.2.0 changes are about.
+#
+# This workflow lives on the csdp-ci branch only.  The pull request against
+# spack/spack-packages should carry the package.py change by itself, so push
+# this branch to a fork to run the checks and open the PR from csdp instead.
+#
+# Only 6.2.0 is exercised.  6.1.1 is a different recipe path (its Makefile
+# hardcodes /usr/local/bin and sets no flags, so it is edited rather than
+# configured) and the 6.2.0 changes do not touch it.
+name: csdp
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  csdp:
+    name: ${{ matrix.runner }} / ${{ matrix.spec }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The headline case.  apple-clang spells the flag "-Xpreprocessor
+          # -fopenmp" rather than -fopenmp, and because that reaches only the
+          # preprocessor it does not link an OpenMP runtime, so libomp has to
+          # come from llvm-openmp.  macOS is also where a case insensitive
+          # filesystem let the INSTALL file satisfy the non-phony install
+          # target, so "make install" reported success and installed nothing.
+          # The compiler is pinned because homebrew gcc is registered below for
+          # openblas's Fortran, and would otherwise be eligible for csdp too.
+          - {runner: macos-latest,     spec: "csdp@6.2.0 +openmp %c=apple-clang"}
+          - {runner: macos-latest,     spec: "csdp@6.2.0 ~openmp %c=apple-clang"}
+          # Same OS, other architecture: macos-latest is arm64.  Drop this leg
+          # if the account has no access to the Intel image.
+          - {runner: macos-15-intel,   spec: "csdp@6.2.0 +openmp %c=apple-clang"}
+
+          # The failure that started this: -m64 is not an option on aarch64, so
+          # the unpatched Makefile's hardcoded CFLAGS failed outright here.
+          - {runner: ubuntu-24.04-arm, spec: "csdp@6.2.0 +openmp"}
+
+          # x86_64 gcc control, both ways round.
+          - {runner: ubuntu-latest,    spec: "csdp@6.2.0 +openmp"}
+          - {runner: ubuntu-latest,    spec: "csdp@6.2.0 ~openmp"}
+
+          # clang 16 and later reject the implicit printf in lib/user_exit.c
+          # once the makefile patch swaps -ansi for -std=gnu99, so this leg is
+          # what include-stdio.patch is for.  Kept ~openmp so that it does not
+          # also depend on the runner shipping libomp for /usr/bin/clang.
+          - {runner: ubuntu-latest,    spec: "csdp@6.2.0 ~openmp %c=clang"}
+
+          # Static BLAS and LAPACK as separate archives, which is the case
+          # where the order of -llapack and -lblas on the link line matters:
+          # liblapack.a references BLAS, so it has to come first.
+          - {runner: ubuntu-latest,    spec: "csdp@6.2.0 +openmp ^netlib-lapack~shared"}
+
+    env:
+      # $SPEC is deliberately unquoted where it is passed to spack, so that it
+      # word splits into separate arguments.  The ~ in ~openmp survives: tilde
+      # expansion happens before parameter expansion, and bash does not rescan
+      # the result, so it is not mistaken for a home directory.
+      SPEC: ${{ matrix.spec }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Clone spack
+        run: |
+          git clone --depth 1 https://github.com/spack/spack.git "$HOME/spack"
+          echo "SPACK_ROOT=$HOME/spack" >> "$GITHUB_ENV"
+
+      - name: Register compilers and externals
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          spack compiler find /usr/bin
+          if [ "$RUNNER_OS" = macOS ]
+          then
+              # openblas wants a Fortran compiler and apple-clang has none.
+              # The runner images ship homebrew gcc, which saves building it.
+              spack compiler find "$(brew --prefix)/bin"
+          fi
+          spack external find --all
+          spack compilers
+
+      - name: Add this checkout as a spack repo
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          spack repo add "$GITHUB_WORKSPACE/repos/spack_repo/builtin"
+          # The commands above already indexed the builtin repo that spack
+          # bootstrapped for itself, which carries different patches for csdp,
+          # so swapping in this checkout leaves that patch index stale and
+          # lookups by sha256 fail:
+          #   Couldn't find patch for package builtin.csdp with sha256: ...
+          # An artifact of substituting a repo underneath spack, not something
+          # an ordinary install runs into.
+          spack clean -m
+          spack repo list
+
+      - name: Concretize
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          spack spec -I $SPEC
+
+      - name: Install
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          spack install --fail-fast --verbose $SPEC
+
+      # Check this before anything that inspects the binaries: otool and ldd
+      # failing on a missing file used to leave the pipeline's exit status to
+      # tee, so an install that produced nothing looked like a pass.
+      - name: Check that something was installed
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          prefix=$(spack location -i $SPEC)
+          echo "prefix=$prefix"
+          echo "PREFIX=$prefix" >> "$GITHUB_ENV"
+          missing=
+          for exe in csdp theta graphtoprob complement rand_graph
+          do
+              [ -x "$prefix/bin/$exe" ] || missing="$missing $exe"
+          done
+          if [ -n "$missing" ]
+          then
+              echo "::error title=Nothing installed::missing from $prefix/bin:$missing"
+              ls -la "$prefix" "$prefix/bin" 2>&1 || true
+              exit 1
+          fi
+          echo "all five programs present in $prefix/bin"
+
+      # Compiling is not enough: apple-clang accepts "-Xpreprocessor -fopenmp"
+      # and still links no OpenMP runtime, so +openmp has to be checked against
+      # what the binary actually pulls in, and ~openmp against its absence.
+      - name: Check the OpenMP runtime
+        run: |
+          if [ "$RUNNER_OS" = macOS ]
+          then otool -L "$PREFIX/bin/csdp" | tee libs.txt
+          else ldd "$PREFIX/bin/csdp" | tee libs.txt
+          fi
+          if grep -qiE 'libomp|libgomp' libs.txt
+          then linked=yes
+          else linked=no
+          fi
+          case "$SPEC" in
+              *+openmp*) want=yes ;;
+              *~openmp*) want=no ;;
+              *) echo "no OpenMP expectation for $SPEC (linked=$linked)"; exit 0 ;;
+          esac
+          if [ "$linked" = "$want" ]
+          then
+              echo "\`$SPEC\` on ${{ matrix.runner }}: OpenMP runtime linked=$linked, as expected." \
+                  >> "$GITHUB_STEP_SUMMARY"
+          else
+              echo "::error title=OpenMP runtime mismatch::$SPEC on ${{ matrix.runner }}: expected linked=$want, got linked=$linked"
+              exit 1
+          fi
+
+      # The point of the makefile patch is that the flags are no longer
+      # hardcoded.  -m64 broke aarch64, -march=native and -mtune=native tuned
+      # the binaries for whichever machine built them, -static is not how one
+      # links on macOS, and -ansi is what used to hide the missing <stdio.h>.
+      # None of them should reach the compiler now.
+      - name: Check the hardcoded flags are gone
+        run: |
+          log="$PREFIX/.spack/spack-build-out.txt.gz"
+          [ -f "$log" ] || { echo "::error title=No build log::$log"; exit 1; }
+          found=$(gunzip -c "$log" \
+              | grep -oE '(^|[[:space:]])-(m64|march=native|mtune=native|Ofast|ansi|static)([[:space:]]|$)' \
+              | tr -d '[:space:]' | sort -u | tr '\n' ' ')
+          if [ -n "$found" ]
+          then
+              echo "::error title=Hardcoded flags survived::$found"
+              exit 1
+          fi
+          echo "none of -m64 -march=native -mtune=native -Ofast -ansi -static reached the compiler"
+          gunzip -c "$log" | grep -oE '\-std=[a-z0-9]+' | sort -u
+
+      # The makefile patch builds as -std=gnu99, where an implicit function
+      # declaration is an error for clang 16 and later and for gcc 14 and
+      # later.  include-stdio.patch is what keeps lib/user_exit.c compiling.
+      - name: Check nothing was implicitly declared
+        run: |
+          log="$PREFIX/.spack/spack-build-out.txt.gz"
+          if gunzip -c "$log" | grep -iE 'implicit declaration|undeclared library function|implicit-function-declaration'
+          then
+              echo "::error title=Implicit declaration::the source was compiled with an implicit declaration"
+              exit 1
+          fi
+          echo "no implicit declarations"
+
+      # Building is not the same as working: solve a problem whose answer is
+      # known.  theta1's optimal value is 23, and csdp ships the expected
+      # output alongside the input.
+      - name: Solve theta1
+        run: |
+          version=$(echo "$SPEC" | sed -n 's/^csdp@\([0-9.]*\).*/\1/p')
+          curl -sSfLo Csdp.tgz \
+              "https://www.coin-or.org/download/source/Csdp/Csdp-$version.tgz"
+          tar xzf Csdp.tgz
+          "$PREFIX/bin/csdp" "Csdp-$version/test/theta1.dat-s" | tee solve.txt
+          grep -q "Success: SDP solved" solve.txt
+          grep -q "Primal objective value: 2.3000000e+01" solve.txt
+          grep -q "Dual objective value: 2.3000000e+01" solve.txt
+          echo "\`$SPEC\` on ${{ matrix.runner }}: theta1 solved, objective 23." \
+              >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect build logs
+        if: failure()
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          mkdir -p build-logs
+          find "$(spack location -S)" -name 'spack-build-*.txt' 2>/dev/null | while read -r log
+          do cp "$log" "build-logs/$(basename "$(dirname "$log")")-$(basename "$log")"
+          done
+          # An install that got far enough to leave a prefix has its log there.
+          if [ -n "$PREFIX" ] && [ -d "$PREFIX/.spack" ]
+          then cp "$PREFIX/.spack/"spack-build-* build-logs/ 2>/dev/null || true
+          fi
+          ls -la build-logs
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: build-logs-${{ matrix.runner }}-${{ strategy.job-index }}
+          path: build-logs
+          if-no-files-found: ignore
