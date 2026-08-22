@@ -1,0 +1,651 @@
+# Checks the linbox recipe added in "linbox: new package".
+#
+# This workflow lives on the linbox-ci branch only.  The pull request against
+# spack/spack-packages should carry the package.py addition by itself, so push
+# this branch to a fork to run the checks and open the PR from linbox instead.
+#
+# Two sweeps share one set of steps, because the interesting checks are the
+# same either way:
+#
+#   * every one of the 2^3 combinations of ~/+flint, ~/+fplll and ~/+ntl, on
+#     one platform with the runner's default compiler;
+#   * the full +flint+fplll+ntl spec on gcc 12/14, clang 17/18, apple-clang,
+#     homebrew gcc, x86_64 and aarch64 Linux, and arm64 and x86_64 macOS.
+#
+# Building is only half the question.  linbox finds its optional dependencies
+# by scanning $HOME/include for a header (macros/ntl-check.m4 and friends), and
+# the path it scans is DEFAULT_CHECKING_PATH -- "/usr /usr/local" -- unless
+# configure is given --with-ntl=<path>.  A spack prefix is in neither, so
+# before configure_args existed this recipe could concretize +ntl, put ntl in
+# the DAG, and quietly install a linbox with NTL support switched off, with
+# nothing in the build failing.  It now passes --with-<name>=<prefix> when a
+# variant is on and --without-<name> when it is off, and these legs are what
+# keeps that true.  Each one checks all four optional dependencies in both
+# directions -- present when asked for, absent when not -- against four
+# independent witnesses:
+#
+# Three of the four are variants.  mpfr is not: linbox never uses it directly,
+# but fplll's public defs.h includes <mpfr.h> and fplll.pc declares no
+# Requires, so an mpfr that linbox.pc does not name is one that no consumer of
+# a +fplll linbox can find.  The recipe keys it off "^mpfr" instead, and its
+# expectation here is the DAG.  The determinant step is what proves the point:
+# it compiles with exactly what pkg-config reports and nothing added by hand.
+#
+#   1. the DAG, from spack spec;
+#   2. config.h in the stage, right after configure and before the long build;
+#   3. the installed include/linbox/config.h, linbox-config and linbox.pc;
+#   4. the link line in the build log.
+#
+# 2 and 3 are what configure believed, 4 is what the compiler was actually
+# handed, and 1 is what we asked spack for.  They can disagree, and which pair
+# disagrees says where the fault is.  Witness 3 also checks that the -I and -L
+# recorded for an enabled dependency point into its spack prefix.
+# --with-ntl=<path> puts that path at the head of the search list rather than
+# in place of it, so "found NTL" and "found the NTL we asked for" are not the
+# same claim.
+#
+# One asymmetry to know about when reading a green run: --without-flint is a
+# no-op.  flint-check.m4 gives its AC_ARG_WITH no action arguments, so "no"
+# falls through to the same DEFAULT_CHECKING_PATH as passing nothing, where
+# --without-ntl and --without-fplll genuinely disable.  The runner images have
+# no flint under /usr, so the ~flint legs pass either way: they are a tripwire
+# for an image that grows one, not a demonstration that the flag works.
+name: linbox
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linbox:
+    name: ${{ matrix.runner }} / ${{ matrix.spec }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- the eight variant combinations -------------------------------
+          #
+          # All on ubuntu-latest with no compiler constraint, so that the only
+          # thing varying between these legs is the variants.  ubuntu-24.04's
+          # unpinned default is gcc 13, which is why there is no separate
+          # gcc@13 leg in the compiler sweep below.
+          - {runner: ubuntu-latest, spec: "linbox ~flint~fplll~ntl"}
+          - {runner: ubuntu-latest, spec: "linbox +flint~fplll~ntl"}
+          - {runner: ubuntu-latest, spec: "linbox ~flint+fplll~ntl"}
+          - {runner: ubuntu-latest, spec: "linbox ~flint~fplll+ntl"}
+          - {runner: ubuntu-latest, spec: "linbox +flint+fplll~ntl"}
+          - {runner: ubuntu-latest, spec: "linbox +flint~fplll+ntl"}
+          - {runner: ubuntu-latest, spec: "linbox ~flint+fplll+ntl"}
+          - {runner: ubuntu-latest, spec: "linbox +flint+fplll+ntl"}
+
+          # ---- the compiler sweep -------------------------------------------
+          #
+          # All variants on, so each of these legs is also an eighth run of the
+          # heaviest combination.  Only linbox itself is pinned: pinning the
+          # whole DAG would rebuild gmp, ntl, flint and openblas once per
+          # compiler for no gain, and it is the linbox recipe under test.
+          # linbox is C++ heavy -- expression templates over Givaro and
+          # fflas-ffpack -- so the compiler legs are where a std= or a
+          # -Werror=... surprise shows up.
+          - {runner: ubuntu-latest, spec: "linbox +flint+fplll+ntl %c=gcc@12 %cxx=gcc@12"}
+          - {runner: ubuntu-latest, spec: "linbox +flint+fplll+ntl %c=gcc@14 %cxx=gcc@14"}
+          - {runner: ubuntu-latest, spec: "linbox +flint+fplll+ntl %c=llvm@17 %cxx=llvm@17"}
+          - {runner: ubuntu-latest, spec: "linbox +flint+fplll+ntl %c=llvm@18 %cxx=llvm@18"}
+
+          # Other architecture, same OS.  linbox reads SIZEOF_LONG and probes
+          # for __int128_t and for endianness in configure, so aarch64 is not
+          # merely a second x86_64.
+          - {runner: ubuntu-24.04-arm, spec: "linbox +flint+fplll+ntl"}
+
+          # macOS.  Homebrew gcc is installed on every macOS leg regardless,
+          # because openblas needs a Fortran compiler and apple-clang has none;
+          # that is also why apple-clang has to be named explicitly here, or it
+          # would be eligible for linbox too.
+          - {runner: macos-latest,   spec: "linbox +flint+fplll+ntl %c=apple-clang %cxx=apple-clang"}
+          - {runner: macos-latest,   spec: "linbox +flint+fplll+ntl %c=gcc@14 %cxx=gcc@14", brew: gcc@14, cxx_pin: "gcc@14"}
+          # Drop this leg if the account has no access to the Intel image.
+          #
+          # netlib-lapack rather than the default openblas: openblas 0.3.34
+          # runs its utest suite as part of its ordinary build, and on this
+          # runner "TEST 1/125 min:smin_negative" takes a bus error after
+          # thirty-five minutes, so the leg never reaches linbox at all.
+          # Nothing to do with this recipe, and swapping the BLAS provider is
+          # cheaper than carrying a known-red leg.  It also happens to be the
+          # only leg not using openblas, which is coverage of its own.
+          - {runner: macos-15-intel, spec: "linbox +flint+fplll+ntl %c=apple-clang %cxx=apple-clang ^netlib-lapack"}
+
+    env:
+      # $SPEC is deliberately unquoted where it is passed to spack, so that it
+      # word splits into separate arguments.  The ~ in ~ntl survives: tilde
+      # expansion happens before parameter expansion, and bash does not rescan
+      # the result, so it is not mistaken for a home directory.
+      SPEC: ${{ matrix.spec }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the toolchains the spec asks for
+        run: |
+          if [ "$RUNNER_OS" = macOS ]
+          then
+              # gcc unversioned is for openblas's Fortran; matrix.brew is the
+              # extra one a leg names in its spec, if any.
+              brew install pkgconf gcc ${{ matrix.brew }}
+          else
+              sudo apt-get update
+              sudo apt-get install -y g++-12 g++-14 clang-17 clang-18
+          fi
+
+      - name: Clone spack
+        run: |
+          git clone --depth 1 https://github.com/spack/spack.git "$HOME/spack"
+          echo "SPACK_ROOT=$HOME/spack" >> "$GITHUB_ENV"
+
+      - name: Register compilers and externals
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          spack compiler find /usr/bin
+          if [ "$RUNNER_OS" = macOS ]
+          then
+              spack compiler find "$(brew --prefix)/bin"
+              for formula in gcc ${{ matrix.brew }}
+              do spack compiler find "$(brew --prefix "$formula")/bin" || true
+              done
+          fi
+
+          # Homebrew's autoconf has to be kept out of the way.  Detected as an
+          # external it comes with no m4 of its own, so it falls back to
+          # /usr/bin/m4, which on macOS is Xcode's gm4 and does not take
+          # --gnu; gmp's autoreconf then fails before anything else can
+          # start.  Excluding the family lets spack build a consistent set.
+          # Linux needs none of this -- its autoconf and m4 agree -- and
+          # building them there would only slow every leg down.
+          if [ "$RUNNER_OS" = macOS ]
+          then spack external find --all --exclude autoconf --exclude automake --exclude libtool --exclude m4
+          else spack external find --all
+          fi
+          spack compilers
+
+      # Without this a spec naming a compiler that was not detected does not
+      # fail -- it concretizes to building that compiler from source, and the
+      # leg burns its six hours on llvm before anyone finds out.  Refusing to
+      # build them turns that into a concretization error in the next step,
+      # and doubles as the guarantee that the compiler under test is the one
+      # actually installed rather than one spack put together on the way.
+      - name: Require the compilers to be the ones just registered
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          spack config add "packages:gcc:buildable:false"
+          spack config add "packages:llvm:buildable:false"
+
+      # No binary mirror on purpose.  binaries.spack.io/develop was tried and
+      # scored zero cache hits on every leg, x86_64 and aarch64 alike -- this
+      # checkout has drifted too far from the commit the cache was built at
+      # for the hashes to match.  It was not free, either: trusting its keys
+      # is an interactive [y/N] prompt, and a step with no stdin answers EOF,
+      # after which spack found one gcc-runtime binary it could not verify and
+      # failed the aarch64 leg outright rather than falling back to source.
+      # From source the whole DAG takes about fifteen minutes a leg.
+      # Only linbox carries the compiler in its spec, which is deliberate:
+      # rebuilding gmp, ntl and openblas once per compiler would cost more
+      # than it tells us, and on Linux it is harmless because clang and gcc
+      # share libstdc++.  macOS is the exception.  apple-clang uses libc++ and
+      # Homebrew gcc uses libstdc++, so an apple-clang libntl.a leaves every
+      # std::__1:: symbol undefined when g++ links it -- and because that
+      # happens inside linbox's AC_TRY_LINK, the failure surfaces as "NTL not
+      # found" rather than as a link error.
+      #
+      # Only the packages that put C++ symbols on linbox's link line need to
+      # move, which is why this is a list rather than packages:all.  Requiring
+      # a compiler of everything asks packages with no C++ at all to grow a
+      # cxx dependency and spack refuses -- "pkgconf cannot have a dependency
+      # on cxx", and less obviously "givaro cannot have a dependency on c",
+      # givaro being C++ only.  Hence %cxx= aimed at the five that have such
+      # an edge.  flint and openblas are C and Fortran and stay where they are.
+      - name: Pin the C++ stack to this compiler
+        if: matrix.cxx_pin
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          for pkg in gmp givaro ntl fplll fflas-ffpack
+          do spack config add "packages:$pkg:require:'%cxx=${{ matrix.cxx_pin }}'"
+          done
+          spack config get packages
+
+      - name: Add this checkout as a spack repo
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          spack repo add "$GITHUB_WORKSPACE/repos/spack_repo/builtin"
+          # The commands above already indexed the builtin repo that spack
+          # bootstrapped for itself, so swapping in this checkout leaves the
+          # patch index stale and lookups by sha256 fail.  An artifact of
+          # substituting a repo underneath spack, not something an ordinary
+          # install runs into.
+          spack clean -m
+          spack repo list
+
+      # Reading the expectation out of the spec, rather than carrying it as a
+      # second matrix field, means the two cannot drift apart.
+      - name: Work out what this spec asks for
+        run: |
+          for variant in flint fplll ntl
+          do
+              case "$SPEC" in
+                  *+$variant*) want=yes ;;
+                  *~$variant*) want=no ;;
+                  *) echo "::error title=Ambiguous spec::$SPEC does not spell out $variant"; exit 1 ;;
+              esac
+              echo "WANT_$(echo "$variant" | tr a-z A-Z)=$want" >> "$GITHUB_ENV"
+              echo "$variant: $want"
+          done
+
+      - name: Concretize
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          spack spec -I $SPEC | tee spec.txt
+
+      # Witness 1: the DAG.  Nothing else in the tree pulls these in -- givaro
+      # depends only on gmp, and fflas-ffpack on givaro and blas/lapack -- so
+      # each of the three appears if and only if its variant is on, and their
+      # absence here is unambiguous rather than merely unobserved.
+      - name: Check the dependency graph matches the variants
+        run: |
+          for variant in flint fplll ntl
+          do
+              eval "want=\$WANT_$(echo "$variant" | tr a-z A-Z)"
+              if grep -qE "(^|[^-[:alnum:]])$variant@" spec.txt
+              then in_dag=yes
+              else in_dag=no
+              fi
+              if [ "$in_dag" != "$want" ]
+              then
+                  echo "::error title=Dependency graph mismatch::$variant: expected in_dag=$want, got $in_dag for $SPEC"
+                  exit 1
+              fi
+              echo "$variant in DAG: $in_dag, as expected"
+          done
+
+          # mpfr is the odd one out: no variant, because linbox never uses it
+          # itself.  It arrives with flint or fplll, both of which depend on
+          # it, and the recipe keys off "^mpfr" rather than off a variant.  So
+          # here the DAG is the expectation rather than something checked
+          # against one, and the witnesses downstream check that configure
+          # honoured it.
+          if grep -qE "(^|[^-[:alnum:]])mpfr@" spec.txt
+          then echo "WANT_MPFR=yes" >> "$GITHUB_ENV"; echo "mpfr in DAG: yes, so it has to be configured in"
+          else echo "WANT_MPFR=no" >> "$GITHUB_ENV"; echo "mpfr in DAG: no, so it has to be configured out"
+          fi
+
+      # Stop after configure first.  config.h answers the whole variant
+      # question in the time it takes to run a configure script, and a failure
+      # here is far easier to read than one that arrives forty minutes into a
+      # template-heavy C++ build.
+      - name: Configure only
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          spack install --fail-fast --until configure $SPEC
+
+      # Witness 2: what configure decided, before anything is compiled.
+      #
+      # AC_DEFINE(HAVE_NTL) and friends land in the unprefixed config.h in the
+      # build directory; AX_PREFIX_CONFIG_H copies them to linbox/config.h as
+      # __LINBOX_HAVE_NTL.  Undetected ones are left as "/* #undef ... */",
+      # which is why the pattern is anchored on "#define ... 1" rather than
+      # just grepping for the name.
+      - name: Check configure detected exactly what was asked for
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          src=$(spack location -c $SPEC 2>/dev/null || true)
+          if [ -z "$src" ] || [ ! -f "$src/config.h" ]
+          then src=$(dirname "$(find /tmp "$SPACK_ROOT/var/spack/stage" -maxdepth 6 -name config.h -path '*linbox*spack-src*' 2>/dev/null | head -1)")
+          fi
+          echo "source dir: $src"
+          test -f "$src/config.h" || { echo "::error title=No generated config.h::nothing at $src"; exit 1; }
+
+          echo "### ${{ matrix.runner }} / \`$SPEC\`" >> "$GITHUB_STEP_SUMMARY"
+          rc=0
+          for variant in flint fplll mpfr ntl
+          do
+              upper=$(echo "$variant" | tr a-z A-Z)
+              eval "want=\$WANT_$upper"
+              if grep -qE "^#define HAVE_$upper 1" "$src/config.h"
+              then found=yes
+              else found=no
+              fi
+              echo "| $variant | asked \`$want\` | configure \`$found\` |" >> "$GITHUB_STEP_SUMMARY"
+              if [ "$found" != "$want" ]
+              then
+                  echo "::error title=Variant not honoured::$variant: asked for $want, configure found $found"
+                  rc=1
+              else
+                  echo "$variant: configure found=$found, as asked"
+              fi
+          done
+
+          # The generated linbox-config and linbox.pc carry LINBOX_DEPS_LIBS,
+          # which is the concatenation of NTL_LIBS, FPLLL_LIBS and FLINT_LIBS.
+          # Empty is the honest answer for a dependency that was not found, so
+          # this is the same fact as config.h seen from the consumer's side.
+          echo "linbox-config --libs:  $(sh "$src/linbox-config" --libs 2>/dev/null || echo '(not generated)')"
+          echo "linbox.pc Libs:        $(sed -n 's/^Libs: //p' "$src/linbox.pc" 2>/dev/null || echo '(not generated)')"
+
+          # When a dependency is in the DAG but undetected, say so in the terms
+          # that explain it, rather than leaving the next reader to rediscover
+          # DEFAULT_CHECKING_PATH.
+          if [ "$rc" != 0 ]
+          then
+              echo "::notice::configure_args passes --with-<name>=<prefix> when a variant is on and --without-<name> when it is off, so a mismatch here is either a flag that did not reach configure or one whose AC_TRY_LINK failed.  The configure line and the checks below say which."
+              sed -n 's/^  \$ \(.*configure.*\)/invoked: \1/p' "$src/config.log" 2>/dev/null | head -3 || true
+              grep -n 'Default path\|for NTL\|for FPLLL\|for FLINT' "$src/config.log" 2>/dev/null | head -20 || true
+          fi
+          exit $rc
+
+      - name: Build
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          spack install --fail-fast --verbose --keep-stage $SPEC
+
+      # Check this before anything that inspects the installed files: a grep
+      # against a path that does not exist is a pass, so an install that
+      # produced nothing would sail through every assertion below.
+      - name: Check that something was installed
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          prefix=$(spack location -i $SPEC)
+          echo "prefix=$prefix"
+          echo "PREFIX=$prefix" >> "$GITHUB_ENV"
+          missing=
+          for f in bin/linbox-config include/linbox/config.h lib/pkgconfig/linbox.pc
+          do
+              [ -e "$prefix/$f" ] || missing="$missing $f"
+          done
+          if [ -n "$missing" ]
+          then
+              echo "::error title=Nothing installed::missing from $prefix:$missing"
+              ls -la "$prefix" "$prefix/lib" "$prefix/bin" 2>&1 || true
+              exit 1
+          fi
+          ls "$prefix/lib" | grep -E 'liblinbox' || { echo "::error title=No library::liblinbox missing from $prefix/lib"; exit 1; }
+
+      # Witness 3: what a consumer of the installed tree is told.
+      #
+      # This is the one that matters in practice.  Anything depending on linbox
+      # reads these three files and nothing else, so if they say NTL is off
+      # then NTL is off, whatever the DAG says.  include/linbox/ring/ntl.h is a
+      # fourth reading of the same fact from a different mechanism: ring/
+      # Makefile.am installs it under "if LINBOX_HAVE_NTL", so its presence is
+      # the automake conditional's answer rather than the preprocessor's.
+      - name: Check the installed tree matches the variants
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          rc=0
+          libs=$("$PREFIX/bin/linbox-config" --libs)
+          pc_libs=$(sed -n 's/^Libs: //p' "$PREFIX/lib/pkgconfig/linbox.pc")
+          echo "linbox-config --libs: $libs"
+          echo "linbox.pc Libs:       $pc_libs"
+
+          for variant in flint fplll mpfr ntl
+          do
+              upper=$(echo "$variant" | tr a-z A-Z)
+              eval "want=\$WANT_$upper"
+
+              # AX_PREFIX_CONFIG_H rewrites config.h with a sed whose
+              # replacement is "#define __LINBOX_\1 \2", where \2 has already
+              # captured the leading space of the original " 1".  So the
+              # installed header spells it "#define __LINBOX_HAVE_NTL  1 " --
+              # two spaces, and a trailing one.  Matching a single space here
+              # made every enabled variant read as disabled.
+              grep -qE "^#define __LINBOX_HAVE_$upper[[:space:]]+1" "$PREFIX/include/linbox/config.h" \
+                  && header=yes || header=no
+              case " $libs " in *" -l$variant "*) config_script=yes ;; *) config_script=no ;; esac
+              case " $pc_libs " in *" -l$variant "*) pkgconfig=yes ;; *) pkgconfig=no ;; esac
+
+              for witness in header config_script pkgconfig
+              do
+                  eval "got=\$$witness"
+                  if [ "$got" != "$want" ]
+                  then
+                      echo "::error title=Installed tree mismatch::$variant via $witness: expected $want, got $got"
+                      rc=1
+                  fi
+              done
+              echo "$variant: header=$header linbox-config=$config_script linbox.pc=$pkgconfig (asked $want)"
+
+              # Every witness above answers "is it on", not "which copy".
+              # --with-<name>=<prefix> only puts that prefix ahead of /usr and
+              # /usr/local in the search list, and all three macros emit
+              # -I<prefix>/include -L<prefix>/lib for a prefix of their own but
+              # a bare -l<name> for /usr or /usr/local.  So a spack copy that
+              # failed the link test would fall through to a system one and
+              # still read as "on" everywhere else.  The prefix is what tells
+              # the two apart.
+              if [ "$want" = yes ]
+              then
+                  dep_prefix=$(spack location -i "$variant")
+                  case "$(cat "$PREFIX/lib/pkgconfig/linbox.pc")" in
+                      *"$dep_prefix"*)
+                          echo "$variant: linbox.pc points into $dep_prefix"
+                          ;;
+                      *)
+                          echo "::error title=Wrong copy::$variant is enabled but linbox.pc names nothing under $dep_prefix, so configure fell through to a copy outside the DAG"
+                          rc=1
+                          ;;
+                  esac
+              fi
+          done
+
+          [ -e "$PREFIX/include/linbox/ring/ntl.h" ] && ntl_hdr=yes || ntl_hdr=no
+          if [ "$ntl_hdr" != "$WANT_NTL" ]
+          then
+              echo "::error title=Installed tree mismatch::include/linbox/ring/ntl.h present=$ntl_hdr, expected $WANT_NTL"
+              rc=1
+          fi
+          echo "linbox/ring/ntl.h present: $ntl_hdr (asked $WANT_NTL)"
+          exit $rc
+
+      # Witness 4: what the compiler was actually handed.  The three preceding
+      # checks all read files configure wrote; this one reads the build.  -lntl
+      # can only come from NTL_LIBS -- spack's compiler wrapper injects -L and
+      # -rpath for dependencies but never a -l -- so its presence in the log is
+      # the link line's own answer, not an artefact of the wrapper.
+      - name: Check the link line matches the variants
+        run: |
+          log="$PREFIX/.spack/spack-build-out.txt"
+          if [ -f "$log.gz" ]
+          then gunzip -c "$log.gz" > build-out.txt
+          elif [ -f "$log" ]
+          then cp "$log" build-out.txt
+          else echo "::error title=No build log::neither $log nor $log.gz"; exit 1
+          fi
+
+          rc=0
+          for variant in flint fplll mpfr ntl
+          do
+              upper=$(echo "$variant" | tr a-z A-Z)
+              eval "want=\$WANT_$upper"
+              if grep -qE '(^|[[:space:]])-l'"$variant"'([[:space:]]|$)' build-out.txt
+              then linked=yes
+              else linked=no
+              fi
+              if [ "$linked" != "$want" ]
+              then
+                  echo "::error title=Link line mismatch::-l$variant in the build log: $linked, expected $want"
+                  rc=1
+              fi
+              echo "$variant: -l$variant on the link line: $linked (asked $want)"
+          done
+          exit $rc
+
+      # The spec pins linbox's compiler, not the whole DAG, so "which compiler
+      # built linbox" is a question about this package's build environment.
+      # SPACK_CXX is the real binary behind the wrapper, so asking it its own
+      # version settles it.
+      - name: Check the compiler is the one the spec named
+        run: |
+          env_log="$PREFIX/.spack/spack-build-env.txt"
+          if [ -f "$env_log.gz" ]
+          then gunzip -c "$env_log.gz" > build-env.txt
+          else cp "$env_log" build-env.txt
+          fi
+          # The file is written to be sourced, so the lines read
+          # "export SPACK_CXX=/usr/bin/g++;" rather than "SPACK_CXX=...".
+          # -E because BSD sed has no \? in a basic regex.
+          cxx=$(sed -nE 's/^(export )?SPACK_CXX=(.*)/\2/p' build-env.txt | tail -1)
+          cxx=${cxx%;}
+          echo "SPACK_CXX=$cxx"
+          test -x "$cxx" || { echo "::error title=No compiler::SPACK_CXX=$cxx is not executable"; exit 1; }
+          "$cxx" --version | head -1 | tee cxx-version.txt
+          # The determinant step has to build with this same compiler, not
+          # with whatever "c++" happens to be.  On the Homebrew gcc leg those
+          # differ, and linking libstdc++ objects against a libc++ test
+          # program fails on Givaro's operator<< before anything runs.
+          echo "BUILD_CXX=$cxx" >> "$GITHUB_ENV"
+
+          # Nothing to compare against on the legs that name no compiler; the
+          # version is still worth having in the log.
+          asked=$(printf '%s\n' "$SPEC" | sed -n 's/.*%cxx=\([^ ]*\).*/\1/p')
+          if [ -z "$asked" ]
+          then
+              echo "::notice::no compiler pinned in the spec; built with $(cat cxx-version.txt)"
+              echo "- compiler: \`$(cat cxx-version.txt)\` (unpinned)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+          fi
+
+          name=${asked%%@*}
+          version=${asked#*@}
+          [ "$version" = "$asked" ] && version=
+
+          case "$name" in
+              gcc)         expect_re='(^|[^[:alnum:]])(g\+\+|GCC|Free Software Foundation)' ;;
+              llvm|clang)  expect_re='clang version' ;;
+              apple-clang) expect_re='Apple clang version' ;;
+              *)           expect_re="$name" ;;
+          esac
+          if ! grep -qE "$expect_re" cxx-version.txt
+          then
+              echo "::error title=Wrong compiler::spec asked for $asked, SPACK_CXX reports $(cat cxx-version.txt)"
+              exit 1
+          fi
+          # apple-clang's version numbering is Xcode's, not upstream llvm's, so
+          # only the family is checkable there; the spec pins no version anyway.
+          if [ -n "$version" ] && [ "$name" != apple-clang ]
+          then
+              major=${version%%.*}
+              if ! grep -qE "(^|[^0-9.])$major\." cxx-version.txt
+              then
+                  echo "::error title=Wrong compiler version::spec asked for $asked, SPACK_CXX reports $(cat cxx-version.txt)"
+                  exit 1
+              fi
+          fi
+          echo "built with $(cat cxx-version.txt), which satisfies $asked"
+          echo "- compiler: \`$(cat cxx-version.txt)\` for \`$asked\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # Building is not the same as working.  examples/det.C is linbox's own
+      # code rather than something written for this workflow, and it reaches
+      # the solutions/ layer, which is where the optional dependencies are
+      # switched in: solutions/det.h and solutions/charpoly.h both branch on
+      # __LINBOX_HAVE_NTL.  So the same program on a +ntl and a ~ntl prefix is
+      # not running the same code, and both have to give 72.
+      - name: Compute a determinant
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          src=$(spack location -c $SPEC 2>/dev/null || true)
+          if [ -z "$src" ] || [ ! -f "$src/examples/det.C" ]
+          then src=$(dirname "$(dirname "$(find /tmp "$SPACK_ROOT/var/spack/stage" -maxdepth 7 -name det.C -path '*linbox*examples*' 2>/dev/null | head -1)")")
+          fi
+          test -f "$src/examples/det.C" || { echo "::error title=No example source::no examples/det.C under $src"; exit 1; }
+
+          # SMS format, as in the example data: "rows cols M", then one-based
+          # row/column/value triples, terminated by "0 0 0".  Upper triangular
+          # with 1, 3, 4 and 6 on the diagonal, so the determinant is 72.
+          cat > mat.sms <<'EOF'
+          4 4 M
+          1 1 1
+          1 2 2
+          2 2 3
+          3 3 4
+          3 4 5
+          4 4 6
+          0 0 0
+          EOF
+
+          # spack load puts the prefixes of linbox and its run dependencies on
+          # PKG_CONFIG_PATH, which is what lets pkg-config resolve linbox.pc's
+          # "Requires: fflas-ffpack" and, through it, givaro and gmp.
+          spack load $SPEC
+          # pkgconf is a build dependency, so it is not on the path that
+          # loading linbox sets up.  Either copy will do.
+          command -v pkg-config >/dev/null || spack load pkgconf
+          cflags=$(pkg-config --cflags linbox)
+          libs=$(pkg-config --libs linbox)
+          # Nothing is added by hand here, and that is the check.  Two
+          # separate include directories have to arrive on their own:
+          #
+          #   mpfr, because fplll's public defs.h includes <mpfr.h> and
+          #   fplll.pc declares no Requires -- linbox publishes it itself via
+          #   --with-mpfr=<prefix>, filling the MPFR_CFLAGS slot that
+          #   LINBOX_DEPS_CFLAGS always had;
+          #
+          #   gmp, because givaro's public gmp++/gmp++.h includes <gmpxx.h>.
+          #   linbox has no --with-gmp at all, so that one has to come down the
+          #   chain: linbox.pc requires fflas-ffpack, which requires givaro,
+          #   whose Cflags carry @REQUIRED_FLAGS@ and therefore GMP_CFLAGS --
+          #   but only once givaro is told where gmp is.
+          #
+          # The Linux legs cannot see either gap: the runner images carry
+          # /usr/include/gmpxx.h, so they compile whether or not the chain
+          # resolves.  macOS is what makes this step mean anything.
+          echo "cflags: $cflags"
+          echo "libs:   $libs"
+          # pkg-config gives -L but not -rpath, and nothing here is on the
+          # default search path.  Spelled out over several lines because the
+          # macOS runners' /bin/bash is 3.2, whose $( ) parser counts parens
+          # naively and chokes on a case pattern's ")" inside a substitution.
+          rpaths=
+          for f in $libs
+          do
+              case $f in
+                  -L*) rpaths="$rpaths -Wl,-rpath,${f#-L}" ;;
+              esac
+          done
+
+          # linbox.pc puts -DDISABLE_COMMENTATOR in Cflags, but examples/ is
+          # built without it, so the example is the one caller that might not
+          # survive the stub.  Retry rather than fail: which of the two
+          # compiled is worth knowing, and neither answer is about the
+          # variants this workflow is here to check.
+          cxx="${BUILD_CXX:-c++}"
+          echo "compiling with $cxx"
+          if ! "$cxx" -o det "$src/examples/det.C" $cflags $libs $rpaths
+          then
+              echo "::notice::retrying with the commentator enabled"
+              "$cxx" -o det "$src/examples/det.C" ${cflags/-DDISABLE_COMMENTATOR/} $libs $rpaths
+          fi
+          ./det mat.sms | tee det.txt
+          grep -q "Matrix is 4 by 4" det.txt
+          grep -q "Determinant is 72" det.txt
+          echo "\`$SPEC\` on ${{ matrix.runner }}: determinant 72, variants as asked." \
+              >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect build logs
+        if: failure()
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          mkdir -p build-logs
+          find "$(spack location -S)" -name 'spack-build-*.txt' -o -name 'config.log' 2>/dev/null | while read -r log
+          do cp "$log" "build-logs/$(basename "$(dirname "$log")")-$(basename "$log")" 2>/dev/null || true
+          done
+          # An install that got far enough to leave a prefix has its log there.
+          if [ -n "$PREFIX" ] && [ -d "$PREFIX/.spack" ]
+          then cp "$PREFIX/.spack/"spack-build-* build-logs/ 2>/dev/null || true
+          fi
+          ls -la build-logs
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: build-logs-${{ matrix.runner }}-${{ strategy.job-index }}
+          path: build-logs
+          if-no-files-found: ignore
